@@ -1,0 +1,1264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Iron Man Repulsor Glove</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+    }
+
+    #stage,
+    #cameraFeed,
+    #threeLayer,
+    #trackingLayer {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    #stage {
+      background: #000;
+    }
+
+    #cameraFeed {
+      object-fit: cover;
+      transform: scaleX(-1);
+      filter: contrast(1.12) saturate(0.92) brightness(0.88);
+      z-index: 1;
+    }
+
+    #threeLayer {
+      pointer-events: none;
+      z-index: 3;
+    }
+
+    #trackingLayer {
+      pointer-events: none;
+      mix-blend-mode: screen;
+      z-index: 5;
+    }
+
+    #repulsorVideo {
+      display: none;
+    }
+
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 50% 52%, transparent 0 48%, rgba(0, 0, 0, 0.24) 68%, rgba(0, 0, 0, 0.72) 100%),
+        linear-gradient(90deg, rgba(0, 255, 122, 0.03), transparent 22% 78%, rgba(0, 255, 122, 0.03));
+      z-index: 8;
+    }
+  </style>
+</head>
+<body>
+  <main id="stage" aria-hidden="true">
+    <video id="cameraFeed" autoplay muted playsinline></video>
+    <canvas id="threeLayer"></canvas>
+    <canvas id="trackingLayer"></canvas>
+    <video id="repulsorVideo" src="assets/repulsor.mp4" muted playsinline loop preload="auto"></video>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+
+    const video = document.getElementById("cameraFeed");
+    const trackingCanvas = document.getElementById("trackingLayer");
+    const trackingCtx = trackingCanvas.getContext("2d", { alpha: true });
+    const threeCanvas = document.getElementById("threeLayer");
+    const repulsorVideo = document.getElementById("repulsorVideo");
+
+    const HAND_CONNECTIONS = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      [13, 17], [17, 18], [18, 19], [19, 20],
+      [0, 17]
+    ];
+
+    const FINGER_CHAINS = {
+      thumb: [1, 2, 3, 4],
+      index: [5, 6, 7, 8],
+      middle: [9, 10, 11, 12],
+      ring: [13, 14, 15, 16],
+      pinky: [17, 18, 19, 20]
+    };
+
+    const state = {
+      rawLandmarks: null,
+      smoothLandmarks: null,
+      hand: null,
+      hasHand: false,
+      lastHandAt: 0,
+      suitStart: 0,
+      suitActive: false,
+      openAmount: 0,
+      openHand: false,
+      fullHandVisible: false,
+      openHoldStart: 0,
+      repulsorFiring: false,
+      repulsorOpacity: 0,
+      repulsorKick: 0,
+      lostFade: 0,
+      lastTime: performance.now()
+    };
+
+    const viewport = {
+      width: 1,
+      height: 1,
+      dpr: 1,
+      videoRect: { x: 0, y: 0, width: 1, height: 1 }
+    };
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas: threeCanvas,
+      alpha: true,
+      antialias: true,
+      powerPreference: "high-performance"
+    });
+    renderer.setClearColor(0x000000, 0);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.25;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -900, 900);
+    camera.position.z = 520;
+
+    const gloveGroup = new THREE.Group();
+    const repulsorGroup = new THREE.Group();
+    scene.add(gloveGroup, repulsorGroup);
+
+    const ambientLight = new THREE.AmbientLight(0x9db3bf, 1.05);
+    const keyLight = new THREE.DirectionalLight(0xffe1aa, 3.6);
+    const rimLight = new THREE.DirectionalLight(0x3ffcff, 2.5);
+    const repulsorLight = new THREE.PointLight(0x7fffff, 0, 650, 1.6);
+    keyLight.position.set(-180, 230, 430);
+    rimLight.position.set(220, 120, 300);
+    repulsorLight.position.set(0, 0, 110);
+    scene.add(ambientLight, keyLight, rimLight, repulsorLight);
+
+    const baseMaterials = {
+      red: new THREE.MeshStandardMaterial({
+        color: 0x0a0f2e,
+        metalness: 0.98,
+        roughness: 0.18,
+        emissive: 0x000000,
+        transparent: true,
+        opacity: 0
+      }),
+      deepRed: new THREE.MeshStandardMaterial({
+        color: 0x020202,
+        metalness: 1.0,
+        roughness: 0.25,
+        emissive: 0x000000,
+        transparent: true,
+        opacity: 0
+      }),
+      gold: new THREE.MeshStandardMaterial({
+        color: 0x173d8c,
+        metalness: 0.96,
+        roughness: 0.16,
+        emissive: 0x000000,
+        transparent: true,
+        opacity: 0
+      }),
+      paleGold: new THREE.MeshStandardMaterial({
+        color: 0x4f8cff,
+        metalness: 0.92,
+        roughness: 0.19,
+        emissive: 0x000000,
+        transparent: true,
+        opacity: 0
+      }),
+      carbon: new THREE.MeshStandardMaterial({
+        color: 0x050505,
+        metalness: 0.88,
+        roughness: 0.32,
+        emissive: 0x000000,
+        transparent: true,
+        opacity: 0
+      }),
+      cyan: new THREE.MeshBasicMaterial({
+        color: 0x5ffcff,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      }),
+      whiteHot: new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      })
+    };
+
+    const repulsorTexture = new THREE.VideoTexture(repulsorVideo);
+    repulsorTexture.colorSpace = THREE.SRGBColorSpace;
+    repulsorTexture.minFilter = THREE.LinearFilter;
+    repulsorTexture.magFilter = THREE.LinearFilter;
+
+    const repulsorVideoMaterial = new THREE.MeshBasicMaterial({
+      map: repulsorTexture,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+
+    const glovePieces = [];
+    const glowPieces = [];
+    const repulsorParts = [];
+    const plateGeometry = createRoundedBoxGeometry(1, 1, 0.18, 10);
+    const slimPlateGeometry = createRoundedBoxGeometry(1, 1, 0.12, 7);
+    const fingerPlateGeometry = createAngularGeometry([
+      [-0.5, -0.5], [0.5, -0.5], [0.42, 0.5], [-0.42, 0.5]
+    ], 11);
+    const slimFingerPlateGeometry = createAngularGeometry([
+      [-0.5, -0.5], [0.5, -0.5], [0.38, 0.5], [-0.38, 0.5]
+    ], 8);
+    const palmGemGeometry = createAngularGeometry([
+      [-0.5, 0.05], [-0.28, 0.46], [0, 0.55], [0.28, 0.46],
+      [0.5, 0.05], [0.24, -0.5], [-0.24, -0.5]
+    ], 9);
+    const triangleVentGeometry = createAngularGeometry([
+      [-0.5, 0.25], [0.5, 0.25], [0.24, -0.3], [0, -0.48], [-0.24, -0.3]
+    ], 6);
+
+    function resize() {
+      viewport.dpr = Math.min(window.devicePixelRatio || 1, 2);
+      viewport.width = window.innerWidth;
+      viewport.height = window.innerHeight;
+
+      trackingCanvas.width = Math.round(viewport.width * viewport.dpr);
+      trackingCanvas.height = Math.round(viewport.height * viewport.dpr);
+      trackingCanvas.style.width = `${viewport.width}px`;
+      trackingCanvas.style.height = `${viewport.height}px`;
+      trackingCtx.setTransform(viewport.dpr, 0, 0, viewport.dpr, 0, 0);
+
+      renderer.setPixelRatio(viewport.dpr);
+      renderer.setSize(viewport.width, viewport.height, false);
+      camera.left = -viewport.width / 2;
+      camera.right = viewport.width / 2;
+      camera.top = viewport.height / 2;
+      camera.bottom = -viewport.height / 2;
+      camera.updateProjectionMatrix();
+      updateVideoRect();
+    }
+
+    function updateVideoRect() {
+      const videoWidth = video.videoWidth || 1280;
+      const videoHeight = video.videoHeight || 720;
+      const scale = Math.max(viewport.width / videoWidth, viewport.height / videoHeight);
+      const width = videoWidth * scale;
+      const height = videoHeight * scale;
+      viewport.videoRect = {
+        x: (viewport.width - width) * 0.5,
+        y: (viewport.height - height) * 0.5,
+        width,
+        height
+      };
+    }
+
+    function screenPoint(landmark) {
+      const rect = viewport.videoRect;
+      return {
+        x: rect.x + (1 - landmark.x) * rect.width,
+        y: rect.y + landmark.y * rect.height,
+        z: landmark.z || 0
+      };
+    }
+
+    function worldPoint(point) {
+      return new THREE.Vector3(point.x - viewport.width / 2, viewport.height / 2 - point.y, 0);
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function smoothstep(edge0, edge1, x) {
+      const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+      return t * t * (3 - 2 * t);
+    }
+
+    function easeOutBack(x) {
+      const c1 = 1.48;
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+    }
+
+    function dist(a, b) {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return Math.hypot(dx, dy);
+    }
+
+    function vecAngle(a, b) {
+      return Math.atan2(b.y - a.y, b.x - a.x);
+    }
+
+    function normalizeVec(vector, fallback = new THREE.Vector3(1, 0, 0)) {
+      if (vector.lengthSq() < 0.0001) return fallback.clone();
+      return vector.clone().normalize();
+    }
+
+    function angleLerp(current, target, alpha) {
+      let delta = target - current;
+      while (delta > Math.PI) delta -= Math.PI * 2;
+      while (delta < -Math.PI) delta += Math.PI * 2;
+      return current + delta * alpha;
+    }
+
+    function createRoundedBoxGeometry(width, height, radius, depth) {
+      const hw = width / 2;
+      const hh = height / 2;
+      const r = Math.min(radius, hw, hh);
+      const shape = new THREE.Shape();
+      shape.moveTo(-hw + r, -hh);
+      shape.lineTo(hw - r, -hh);
+      shape.quadraticCurveTo(hw, -hh, hw, -hh + r);
+      shape.lineTo(hw, hh - r);
+      shape.quadraticCurveTo(hw, hh, hw - r, hh);
+      shape.lineTo(-hw + r, hh);
+      shape.quadraticCurveTo(-hw, hh, -hw, hh - r);
+      shape.lineTo(-hw, -hh + r);
+      shape.quadraticCurveTo(-hw, -hh, -hw + r, -hh);
+
+      const geometry = new THREE.ExtrudeGeometry(shape, {
+        depth,
+        bevelEnabled: true,
+        bevelThickness: 0.07,
+        bevelSize: 0.035,
+        bevelSegments: 4
+      });
+      geometry.computeBoundingBox();
+      const center = new THREE.Vector3();
+      geometry.boundingBox.getCenter(center);
+      geometry.translate(-center.x, -center.y, -center.z);
+      return geometry;
+    }
+
+    function createAngularGeometry(points, depth) {
+      const shape = new THREE.Shape();
+      shape.moveTo(points[0][0], points[0][1]);
+      for (let i = 1; i < points.length; i++) {
+        shape.lineTo(points[i][0], points[i][1]);
+      }
+      shape.closePath();
+
+      const geometry = new THREE.ExtrudeGeometry(shape, {
+        depth,
+        bevelEnabled: true,
+        bevelThickness: 0.06,
+        bevelSize: 0.03,
+        bevelSegments: 3
+      });
+      geometry.computeBoundingBox();
+      const center = new THREE.Vector3();
+      geometry.boundingBox.getCenter(center);
+      geometry.translate(-center.x, -center.y, -center.z);
+      return geometry;
+    }
+
+    function cloneMaterial(key, opacity = 1) {
+      const material = baseMaterials[key].clone();
+      material.transparent = true;
+      material.opacity = 0;
+      material.userData.finalOpacity = opacity;
+      return material;
+    }
+
+    function addPiece(config) {
+      const mesh = new THREE.Mesh(config.geometry || plateGeometry, cloneMaterial(config.material || "red", config.opacity ?? 0.96));
+      mesh.visible = false;
+      mesh.userData = {
+        ...config,
+        targetPosition: new THREE.Vector3(),
+        targetScale: new THREE.Vector3(1, 1, 1),
+        targetRotation: 0,
+        currentPosition: new THREE.Vector3(),
+        currentScale: new THREE.Vector3(1, 1, 1),
+        currentRotation: 0
+      };
+      gloveGroup.add(mesh);
+      glovePieces.push(mesh);
+      return mesh;
+    }
+
+    function addGlow(mesh) {
+      glowPieces.push(mesh);
+      repulsorGroup.add(mesh);
+      return mesh;
+    }
+
+    function createGlove() {
+      addPiece({
+        name: "forearm-extension-shell",
+        kind: "palm",
+        mode: "barX",
+        material: "deepRed",
+        delay: 0,
+        duration: 0.7,
+        localX: 0,
+        localY: -0.72,
+        sizeX: 1.42,
+        sizeY: 0.34,
+        z: 10,
+        flyY: -1.2,
+        flyZ: 150,
+        startRot: 0.18
+      });
+      addPiece({
+        name: "wrist-top-trim",
+        kind: "palm",
+        mode: "barX",
+        material: "gold",
+        delay: 0.12,
+        duration: 0.55,
+        localX: 0,
+        localY: -0.52,
+        sizeX: 1.5,
+        sizeY: 0.065,
+        z: 26,
+        flyY: -0.9,
+        flyZ: 130,
+        startRot: -0.12,
+        opacity: 0.88
+      });
+      addPiece({
+        name: "wrist-bottom-trim",
+        kind: "palm",
+        mode: "barX",
+        material: "gold",
+        delay: 0.08,
+        duration: 0.55,
+        localX: 0,
+        localY: -0.88,
+        sizeX: 1.42,
+        sizeY: 0.06,
+        z: 26,
+        flyY: -1.1,
+        flyZ: 130,
+        startRot: 0.1,
+        opacity: 0.82
+      });
+      addPiece({
+        name: "wrist-cuff-left",
+        kind: "palm",
+        mode: "barX",
+        material: "deepRed",
+        delay: 0,
+        duration: 0.65,
+        localX: -0.28,
+        localY: -0.38,
+        sizeX: 0.92,
+        sizeY: 0.26,
+        z: 12,
+        flyX: -0.9,
+        flyY: -0.15,
+        flyZ: 130,
+        startRot: -0.7
+      });
+      addPiece({
+        name: "wrist-cuff-right",
+        kind: "palm",
+        mode: "barX",
+        material: "deepRed",
+        delay: 0.08,
+        duration: 0.65,
+        localX: 0.28,
+        localY: -0.38,
+        sizeX: 0.92,
+        sizeY: 0.26,
+        z: 13,
+        flyX: 0.9,
+        flyY: -0.1,
+        flyZ: 130,
+        startRot: 0.7
+      });
+      addPiece({
+        name: "gauntlet-lower-gold",
+        kind: "palm",
+        mode: "barX",
+        material: "gold",
+        delay: 0.3,
+        duration: 0.72,
+        localX: 0,
+        localY: -0.24,
+        sizeX: 1.38,
+        sizeY: 0.075,
+        z: 20,
+        flyY: -0.8,
+        flyZ: 150,
+        startRot: 0.3
+      });
+      addPiece({
+        name: "main-palm-red",
+        kind: "palm",
+        mode: "barY",
+        material: "red",
+        delay: 0.58,
+        duration: 0.9,
+        localX: 0,
+        localY: 0.1,
+        sizeX: 0.92,
+        sizeY: 1.02,
+        z: 28,
+        flyY: 0.85,
+        flyZ: 190,
+        startRot: -0.4
+      });
+      addPiece({
+        name: "inner-palm-gold",
+        kind: "palm",
+        mode: "barY",
+        material: "paleGold",
+        geometry: palmGemGeometry,
+        delay: 0.82,
+        duration: 0.78,
+        localX: 0,
+        localY: 0.12,
+        sizeX: 0.58,
+        sizeY: 0.62,
+        z: 44,
+        flyZ: 170,
+        startRot: 0.6,
+        opacity: 0.88
+      });
+      addPiece({
+        name: "left-palm-side",
+        kind: "palm",
+        mode: "barY",
+        material: "deepRed",
+        delay: 1.05,
+        duration: 0.65,
+        localX: -0.52,
+        localY: -0.1,
+        sizeX: 0.5,
+        sizeY: 0.24,
+        z: 38,
+        flyX: -1.1,
+        flyZ: 120,
+        startRot: -0.5
+      });
+      addPiece({
+        name: "right-palm-side",
+        kind: "palm",
+        mode: "barY",
+        material: "deepRed",
+        delay: 1.05,
+        duration: 0.65,
+        localX: 0.52,
+        localY: -0.1,
+        sizeX: 0.5,
+        sizeY: 0.24,
+        z: 38,
+        flyX: 1.1,
+        flyZ: 120,
+        startRot: 0.5
+      });
+
+      addMetacarpalAndKnucklePlates();
+
+      addFingerPieces("thumb", FINGER_CHAINS.thumb, 0.95, 1.08, "gold");
+      addFingerPieces("index", FINGER_CHAINS.index, 1.25, 1.22, "red");
+      addFingerPieces("middle", FINGER_CHAINS.middle, 1.38, 1.3, "red");
+      addFingerPieces("ring", FINGER_CHAINS.ring, 1.52, 1.18, "gold");
+      addFingerPieces("pinky", FINGER_CHAINS.pinky, 1.68, 1.02, "red");
+
+      const palmVent = addPiece({
+        name: "repulsor-seat-carbon",
+        kind: "palm",
+        mode: "barY",
+        material: "carbon",
+        geometry: triangleVentGeometry,
+        delay: 1.92,
+        duration: 0.55,
+        localX: 0,
+        localY: 0.1,
+        sizeX: 0.34,
+        sizeY: 0.36,
+        z: 57,
+        flyZ: 90,
+        startRot: 0.2,
+        opacity: 0.78
+      });
+      palmVent.userData.finalPulse = true;
+
+      createRepulsor();
+    }
+
+    function addMetacarpalAndKnucklePlates() {
+      const metacarpals = [
+        ["thumb-metacarpal-shell", 0, 5, "deepRed", 0.9, 0.15, 0.96, 50, -0.7, 0, 130, -0.45],
+        ["center-metacarpal-spine", 0, 9, "gold", 1.0, 0.12, 0.96, 55, 0, 0.6, 145, 0.35],
+        ["ring-metacarpal-shell", 0, 13, "deepRed", 1.08, 0.13, 0.94, 51, 0, 0.55, 135, -0.28],
+        ["pinky-metacarpal-shell", 0, 17, "red", 1.16, 0.11, 0.92, 50, 0.6, 0, 130, 0.35]
+      ];
+
+      for (const [name, a, b, material, delay, widthFactor, lengthFactor, z, flyX, flyY, flyZ, startRot] of metacarpals) {
+        addPiece({
+          name,
+          kind: "segment",
+          a,
+          b,
+          material,
+          delay,
+          duration: 0.64,
+          widthFactor,
+          lengthFactor,
+          z,
+          flyX,
+          flyY,
+          flyZ,
+          startRot
+        });
+      }
+
+      const bridges = [
+        ["knuckle-bridge-index-middle", 5, 9, "gold", 1.1, 0.18, 1.16, 62, 0.22],
+        ["knuckle-bridge-middle-ring", 9, 13, "paleGold", 1.18, 0.18, 1.16, 63, -0.18],
+        ["knuckle-bridge-ring-pinky", 13, 17, "gold", 1.26, 0.17, 1.14, 62, 0.18]
+      ];
+
+      for (const [name, a, b, material, delay, widthFactor, lengthFactor, z, startRot] of bridges) {
+        addPiece({
+          name,
+          kind: "segment",
+          a,
+          b,
+          material,
+          delay,
+          duration: 0.5,
+          widthFactor,
+          lengthFactor,
+          z,
+          flyY: 0.35,
+          flyZ: 110,
+          startRot,
+          opacity: 0.9
+        });
+      }
+    }
+
+    function addFingerPieces(name, chain, baseDelay, widthFactor, accentMaterial) {
+      const materialPlan = name === "thumb"
+        ? ["deepRed", "gold", "red"]
+        : ["deepRed", accentMaterial, "red"];
+
+      for (let i = 0; i < chain.length - 1; i++) {
+        addPiece({
+          name: `${name}-armor-${i}`,
+          kind: "segment",
+          a: chain[i],
+          b: chain[i + 1],
+          material: materialPlan[i] || "red",
+          geometry: i === 0 ? fingerPlateGeometry : slimFingerPlateGeometry,
+          delay: baseDelay + i * 0.22,
+          duration: 0.62,
+          widthFactor: (0.19 - i * 0.02) * widthFactor,
+          lengthFactor: i === 0 ? 0.98 : 0.88,
+          z: 48 + i * 6,
+          flyX: (name === "thumb" ? -0.8 : (chain[0] - 11) * 0.08),
+          flyY: 0.55 + i * 0.15,
+          flyZ: 150 - i * 22,
+          startRot: (i % 2 === 0 ? 0.7 : -0.55)
+        });
+
+        addPiece({
+          name: `${name}-ridge-${i}`,
+          kind: "segment",
+          a: chain[i],
+          b: chain[i + 1],
+          material: "gold",
+          geometry: slimPlateGeometry,
+          delay: baseDelay + i * 0.22 + 0.08,
+          duration: 0.45,
+          widthFactor: (0.07 - i * 0.008) * widthFactor,
+          lengthFactor: i === 0 ? 0.86 : 0.78,
+          z: 58 + i * 6,
+          flyY: 0.4 + i * 0.1,
+          flyZ: 110 - i * 14,
+          startRot: 0,
+          opacity: 0.82
+        });
+      }
+
+      for (let i = 0; i < chain.length - 1; i++) {
+        addPiece({
+          name: `${name}-joint-seal-${i}`,
+          kind: "joint",
+          index: chain[i + 1],
+          material: "carbon",
+          geometry: slimPlateGeometry,
+          delay: baseDelay + 0.18 + i * 0.22,
+          duration: 0.45,
+          size: (0.24 - i * 0.024) * widthFactor,
+          z: 64 + i * 5,
+          flyZ: 70,
+          startRot: 0.35,
+          opacity: 0.82
+        });
+      }
+    }
+
+    function createRepulsor() {
+      const videoPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), repulsorVideoMaterial);
+      videoPlane.renderOrder = 20;
+      videoPlane.userData.role = "video";
+      repulsorParts.push(videoPlane);
+      repulsorGroup.add(videoPlane);
+
+      const outerRing = addGlow(new THREE.Mesh(
+        new THREE.TorusGeometry(1, 0.06, 24, 96),
+        baseMaterials.cyan.clone()
+      ));
+      outerRing.userData.role = "outer";
+      repulsorParts.push(outerRing);
+
+      const innerRing = addGlow(new THREE.Mesh(
+        new THREE.TorusGeometry(1, 0.035, 20, 96),
+        baseMaterials.whiteHot.clone()
+      ));
+      innerRing.userData.role = "inner";
+      repulsorParts.push(innerRing);
+
+      const flare = addGlow(new THREE.Mesh(
+        new THREE.CircleGeometry(1, 96),
+        baseMaterials.cyan.clone()
+      ));
+      flare.userData.role = "flare";
+      repulsorParts.push(flare);
+
+      for (const part of repulsorParts) {
+        part.visible = false;
+        part.material.transparent = true;
+        part.material.opacity = 0;
+        part.material.depthWrite = false;
+      }
+    }
+
+    function resetGlove() {
+      for (const mesh of glovePieces) {
+        mesh.visible = false;
+        mesh.material.opacity = 0;
+        mesh.userData.currentScale.set(0.001, 0.001, 1);
+      }
+
+      for (const part of repulsorParts) {
+        part.visible = false;
+        part.material.opacity = 0;
+      }
+
+      state.repulsorOpacity = 0;
+      repulsorLight.intensity = 0;
+    }
+
+    function smoothLandmarks(landmarks) {
+      if (!state.smoothLandmarks || state.smoothLandmarks.length !== landmarks.length) {
+        state.smoothLandmarks = landmarks.map((landmark) => ({
+          x: landmark.x,
+          y: landmark.y,
+          z: landmark.z || 0
+        }));
+        return state.smoothLandmarks;
+      }
+
+      for (let i = 0; i < landmarks.length; i++) {
+        const source = landmarks[i];
+        const target = state.smoothLandmarks[i];
+        const dx = source.x - target.x;
+        const dy = source.y - target.y;
+        const dz = (source.z || 0) - target.z;
+        const speed = Math.hypot(dx, dy, dz);
+        const alpha = clamp(0.2 + speed * 18, 0.18, 0.52);
+        target.x = lerp(target.x, source.x, alpha);
+        target.y = lerp(target.y, source.y, alpha);
+        target.z = lerp(target.z, source.z || 0, alpha);
+      }
+
+      return state.smoothLandmarks;
+    }
+
+    function computeHand(landmarks) {
+      updateVideoRect();
+      const points = landmarks.map(screenPoint);
+      const world = points.map(worldPoint);
+      const wrist = world[0];
+      const indexMcp = world[5];
+      const middleMcp = world[9];
+      const ringMcp = world[13];
+      const pinkyMcp = world[17];
+
+      const palmCenter = new THREE.Vector3()
+        .add(wrist)
+        .add(indexMcp)
+        .add(middleMcp)
+        .add(ringMcp)
+        .add(pinkyMcp)
+        .multiplyScalar(1 / 5);
+
+      const axisY = normalizeVec(middleMcp.clone().sub(wrist), new THREE.Vector3(0, 1, 0));
+      let axisX = normalizeVec(indexMcp.clone().sub(pinkyMcp), new THREE.Vector3(1, 0, 0));
+      const dot = axisX.dot(axisY);
+      axisX = normalizeVec(axisX.addScaledVector(axisY, -dot), new THREE.Vector3(1, 0, 0));
+      const palmSize = Math.max(world[0].distanceTo(world[9]), world[5].distanceTo(world[17]) * 0.92, 1);
+      const palmWidth = Math.max(world[5].distanceTo(world[17]), palmSize * 0.58);
+      const axisYAngle = Math.atan2(axisY.y, axisY.x);
+      const axisXAngle = Math.atan2(axisX.y, axisX.x);
+      const openAmount = getOpenAmount(points);
+      const fullHandVisible = getFullHandVisible(points, landmarks, openAmount);
+
+      return {
+        landmarks,
+        points,
+        world,
+        wrist,
+        palmCenter,
+        axisX,
+        axisY,
+        palmSize,
+        palmWidth,
+        axisXAngle,
+        axisYAngle,
+        openAmount,
+        fullHandVisible,
+        openHand: openAmount > 0.68
+      };
+    }
+
+    function getOpenAmount(points) {
+      const wrist = points[0];
+      const palmSize = Math.max(dist(points[0], points[9]), dist(points[5], points[17]) * 0.9, 1);
+      const fingerTips = [8, 12, 16, 20];
+      const fingerPips = [6, 10, 14, 18];
+      let score = 0;
+
+      for (let i = 0; i < fingerTips.length; i++) {
+        const tipDistance = dist(points[fingerTips[i]], wrist);
+        const pipDistance = dist(points[fingerPips[i]], wrist);
+        score += clamp((tipDistance - pipDistance + palmSize * 0.08) / (palmSize * 0.26), 0, 1);
+      }
+
+      const thumbScore = clamp((dist(points[4], points[17]) - dist(points[3], points[17]) + palmSize * 0.08) / (palmSize * 0.22), 0, 1);
+      return clamp((score + thumbScore) / 5, 0, 1);
+    }
+
+    function getFullHandVisible(points, landmarks, openAmount) {
+      const palmSize = Math.max(dist(points[0], points[9]), dist(points[5], points[17]) * 0.9, 1);
+      const margin = 18;
+      const allInside = [0, 4, 5, 8, 9, 12, 13, 16, 17, 20].every((index) => {
+        const point = points[index];
+        return point.x > margin && point.x < viewport.width - margin && point.y > margin && point.y < viewport.height - margin;
+      });
+      const fingersExtended = [[8, 6], [12, 10], [16, 14], [20, 18]].every(([tip, pip]) => {
+        return dist(points[tip], points[0]) - dist(points[pip], points[0]) > palmSize * 0.12;
+      });
+      const thumbExtended = dist(points[4], points[17]) - dist(points[3], points[17]) > palmSize * 0.08;
+      const fanOpen = dist(points[5], points[17]) / palmSize > 0.46 && dist(points[8], points[20]) / palmSize > 0.65;
+
+      const wrist = landmarks[0];
+      const index = landmarks[5];
+      const pinky = landmarks[17];
+      const v1 = {
+        x: index.x - wrist.x,
+        y: index.y - wrist.y,
+        z: ((index.z || 0) - (wrist.z || 0)) * 0.8
+      };
+      const v2 = {
+        x: pinky.x - wrist.x,
+        y: pinky.y - wrist.y,
+        z: ((pinky.z || 0) - (wrist.z || 0)) * 0.8
+      };
+      const crossZ = v1.x * v2.y - v1.y * v2.x;
+      const normalLength = Math.hypot(
+        v1.y * v2.z - v1.z * v2.y,
+        v1.z * v2.x - v1.x * v2.z,
+        crossZ
+      ) || 1;
+
+      return allInside && fingersExtended && thumbExtended && fanOpen && openAmount > 0.8 && Math.abs(crossZ) / normalLength > 0.4;
+    }
+
+    function onHandResults(results) {
+      const now = performance.now();
+      const landmarks = results.multiHandLandmarks && results.multiHandLandmarks[0];
+
+      if (!landmarks) {
+        state.hasHand = false;
+        state.rawLandmarks = null;
+        state.openHoldStart = 0;
+        state.repulsorFiring = false;
+        state.fullHandVisible = false;
+        return;
+      }
+
+      const wasLost = !state.hasHand || now - state.lastHandAt > 700;
+      state.hasHand = true;
+      state.rawLandmarks = landmarks;
+      state.lastHandAt = now;
+      const smoothed = smoothLandmarks(landmarks);
+      state.hand = computeHand(smoothed);
+      state.openAmount = lerp(state.openAmount, state.hand.openAmount, 0.24);
+      state.openHand = state.openAmount > 0.64;
+      state.fullHandVisible = state.hand.fullHandVisible;
+
+      if (state.fullHandVisible && state.suitActive) {
+        if (!state.openHoldStart) state.openHoldStart = now;
+      } else {
+        state.openHoldStart = 0;
+        state.repulsorFiring = false;
+      }
+
+      if (wasLost && state.hand) {
+        state.suitStart = now;
+        state.suitActive = true;
+        state.repulsorKick = 0;
+        state.openHoldStart = 0;
+        state.repulsorFiring = false;
+        resetGlove();
+      }
+    }
+
+    function drawTrackingLayer(timeSeconds, suitTime) {
+      trackingCtx.clearRect(0, 0, viewport.width, viewport.height);
+      if (!state.hand || performance.now() - state.lastHandAt > 520) return;
+
+      const hand = state.hand;
+      const overlayAlpha = state.suitActive ? 1 - smoothstep(1.9, 2.85, suitTime) : 1;
+      if (overlayAlpha <= 0.02) return;
+      const pulse = 0.74 + Math.sin(timeSeconds * 8.0) * 0.12;
+
+      trackingCtx.save();
+      trackingCtx.globalAlpha = overlayAlpha;
+      trackingCtx.lineCap = "round";
+      trackingCtx.lineJoin = "round";
+      trackingCtx.globalCompositeOperation = "lighter";
+      trackingCtx.shadowColor = "rgba(0, 255, 98, 0.95)";
+      trackingCtx.shadowBlur = 14;
+      trackingCtx.strokeStyle = `rgba(49, 255, 110, ${0.72 * pulse})`;
+      trackingCtx.lineWidth = 2;
+
+      trackingCtx.beginPath();
+      for (const [a, b] of HAND_CONNECTIONS) {
+        const pa = hand.points[a];
+        const pb = hand.points[b];
+        trackingCtx.moveTo(pa.x, pa.y);
+        trackingCtx.lineTo(pb.x, pb.y);
+      }
+      trackingCtx.stroke();
+
+      trackingCtx.lineWidth = 1.1;
+      trackingCtx.strokeStyle = "rgba(168, 255, 190, 0.42)";
+      drawPalmContour(hand);
+
+      trackingCtx.shadowBlur = 18;
+      for (let i = 0; i < hand.points.length; i++) {
+        const point = hand.points[i];
+        const radius = i === 0 || i === 8 || i === 12 || i === 16 || i === 20
+          ? 3.1 + Math.sin(timeSeconds * 9 + i) * 0.4
+          : 2.05;
+        trackingCtx.fillStyle = i === 8 || i === 12 || i === 16 || i === 20 || i === 4
+          ? "rgba(175, 255, 198, 0.92)"
+          : `rgba(73, 255, 126, ${0.7 * pulse})`;
+        trackingCtx.beginPath();
+        trackingCtx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        trackingCtx.fill();
+      }
+
+      if (!state.suitActive) {
+        drawPalmRepulsorGuide(hand, timeSeconds, suitTime);
+      }
+      trackingCtx.restore();
+    }
+
+    function drawPalmContour(hand) {
+      const contour = [0, 5, 9, 13, 17, 0];
+      trackingCtx.beginPath();
+      for (let i = 0; i < contour.length; i++) {
+        const p = hand.points[contour[i]];
+        if (i === 0) trackingCtx.moveTo(p.x, p.y);
+        else trackingCtx.lineTo(p.x, p.y);
+      }
+      trackingCtx.stroke();
+
+      trackingCtx.beginPath();
+      trackingCtx.moveTo(hand.points[5].x, hand.points[5].y);
+      trackingCtx.lineTo(hand.points[17].x, hand.points[17].y);
+      trackingCtx.moveTo(hand.points[0].x, hand.points[0].y);
+      trackingCtx.lineTo(hand.points[9].x, hand.points[9].y);
+      trackingCtx.stroke();
+    }
+
+    function drawPalmRepulsorGuide(hand, timeSeconds, suitTime) {
+      const palm = worldToScreen(hand.palmCenter);
+      const radius = clamp(hand.palmSize * 0.24, 20, 58);
+      const active = state.repulsorOpacity;
+      const ready = smoothstep(1.7, 2.65, suitTime);
+
+      trackingCtx.save();
+      trackingCtx.translate(palm.x, palm.y);
+      trackingCtx.rotate(-hand.axisXAngle);
+      trackingCtx.shadowColor = active > 0.05 ? "rgba(124, 255, 255, 1)" : "rgba(0, 255, 98, 0.8)";
+      trackingCtx.shadowBlur = 18 + active * 32;
+      trackingCtx.strokeStyle = `rgba(${active > 0.05 ? "160, 255, 255" : "54, 255, 119"}, ${0.28 + ready * 0.34 + active * 0.35})`;
+      trackingCtx.lineWidth = 1.4 + active * 1.6;
+      trackingCtx.beginPath();
+      trackingCtx.arc(0, 0, radius * (0.78 + active * 0.12), 0, Math.PI * 2);
+      trackingCtx.stroke();
+
+      for (let i = 0; i < 4; i++) {
+        const a = timeSeconds * (1.5 + active * 1.8) + i * Math.PI * 0.5;
+        trackingCtx.beginPath();
+        trackingCtx.moveTo(Math.cos(a) * radius * 0.54, Math.sin(a) * radius * 0.54);
+        trackingCtx.lineTo(Math.cos(a) * radius * 0.86, Math.sin(a) * radius * 0.86);
+        trackingCtx.stroke();
+      }
+      trackingCtx.restore();
+    }
+
+    function worldToScreen(vector) {
+      return {
+        x: vector.x + viewport.width / 2,
+        y: viewport.height / 2 - vector.y
+      };
+    }
+
+    function updateGlove(timeSeconds, delta) {
+      const now = performance.now();
+      const visibleHand = state.hand && now - state.lastHandAt < 520;
+      state.lostFade = lerp(state.lostFade, visibleHand ? 1 : 0, visibleHand ? 0.2 : 0.06);
+      gloveGroup.visible = state.lostFade > 0.02;
+      repulsorGroup.visible = state.lostFade > 0.02;
+
+      if (!state.hand) return;
+
+      const suitTime = state.suitActive ? Math.max(0, (now - state.suitStart) / 1000) : 0;
+      for (const mesh of glovePieces) {
+        updatePiece(mesh, state.hand, suitTime, timeSeconds);
+      }
+
+      updateRepulsor(state.hand, suitTime, timeSeconds, delta, now);
+    }
+
+    function updatePiece(mesh, hand, suitTime, timeSeconds) {
+      const data = mesh.userData;
+      const target = data.kind === "segment"
+        ? getSegmentTarget(data, hand)
+        : data.kind === "joint"
+          ? getJointTarget(data, hand)
+          : getPalmTarget(data, hand);
+
+      if (!target) return;
+
+      const raw = clamp((suitTime - data.delay) / data.duration, 0, 1);
+      const ease = clamp(easeOutBack(raw), 0, 1.08);
+      const appear = smoothstep(0, 0.3, raw) * state.lostFade;
+      const flyX = data.flyX || 0;
+      const flyY = data.flyY || 0;
+      const flyZ = data.flyZ || 0;
+      const startOffset = hand.axisX.clone().multiplyScalar(flyX * hand.palmSize)
+        .add(hand.axisY.clone().multiplyScalar(flyY * hand.palmSize));
+
+      const finalPosition = target.position;
+      const animatedPosition = finalPosition.clone().addScaledVector(startOffset, 1 - ease);
+      animatedPosition.z = target.z + flyZ * (1 - ease) + Math.sin(raw * Math.PI) * 22;
+
+      mesh.userData.currentPosition.lerp(animatedPosition, 0.34);
+      mesh.position.copy(mesh.userData.currentPosition);
+      mesh.userData.currentRotation = angleLerp(mesh.userData.currentRotation, target.rotation + (data.startRot || 0) * (1 - ease), 0.32);
+      mesh.rotation.set(0, 0, mesh.userData.currentRotation);
+
+      const scalePulse = 1;
+      const desiredScale = target.scale.clone().multiplyScalar((0.58 + ease * 0.42) * scalePulse);
+      mesh.userData.currentScale.lerp(desiredScale, 0.34);
+      mesh.scale.copy(mesh.userData.currentScale);
+
+      const materialPulse = data.kind === "joint" ? 0.9 + Math.sin(timeSeconds * 7 + data.delay) * 0.05 : 1;
+      mesh.visible = appear > 0.01;
+      mesh.material.opacity = (mesh.material.userData.finalOpacity ?? 1) * appear * materialPulse;
+
+      if (mesh.material.emissive) {
+        mesh.material.emissive.setRGB(0, 0, 0);
+      }
+    }
+
+    function getPalmTarget(data, hand) {
+      const x = hand.axisX.clone().multiplyScalar((data.localX || 0) * hand.palmWidth);
+      const y = hand.axisY.clone().multiplyScalar((data.localY || 0) * hand.palmSize);
+      const position = hand.palmCenter.clone().add(x).add(y);
+      const acrossSize = hand.palmWidth * (data.sizeX || 1);
+      const lengthSize = hand.palmSize * (data.sizeY || 1);
+      const rotation = data.mode === "barX" ? hand.axisXAngle : hand.axisYAngle;
+      const scale = data.mode === "barX"
+        ? new THREE.Vector3(acrossSize, lengthSize, 1)
+        : new THREE.Vector3(lengthSize, acrossSize, 1);
+
+      return {
+        position,
+        scale,
+        rotation,
+        z: data.z || 20
+      };
+    }
+
+    function getSegmentTarget(data, hand) {
+      const a = hand.world[data.a];
+      const b = hand.world[data.b];
+      const center = a.clone().lerp(b, 0.5);
+      const length = a.distanceTo(b) * (data.lengthFactor || 0.82);
+      const width = hand.palmSize * (data.widthFactor || 0.14);
+      return {
+        position: center,
+        scale: new THREE.Vector3(length, width, 1),
+        rotation: Math.atan2(b.y - a.y, b.x - a.x),
+        z: data.z || 45
+      };
+    }
+
+    function getJointTarget(data, hand) {
+      const point = hand.world[data.index];
+      const previousIndex = Math.max(data.index - 1, 0);
+      const previous = hand.world[previousIndex] || hand.wrist;
+      const size = hand.palmSize * (data.size || 0.16);
+      return {
+        position: point.clone(),
+        scale: new THREE.Vector3(size * 1.25, size * 0.54, 1),
+        rotation: Math.atan2(point.y - previous.y, point.x - previous.x),
+        z: data.z || 60
+      };
+    }
+
+    function updateRepulsor(hand, suitTime, timeSeconds, delta, now) {
+      const repulsorReady = smoothstep(1.55, 2.65, suitTime);
+      const openCharged = state.openHoldStart && now - state.openHoldStart >= 1000;
+      const shouldFire = state.fullHandVisible && openCharged && repulsorReady > 0.25;
+
+      if (shouldFire && !state.repulsorFiring) {
+        state.repulsorKick = now;
+        repulsorVideo.currentTime = 0;
+        repulsorVideo.play().catch(() => {});
+      }
+      state.repulsorFiring = shouldFire;
+
+      if (!shouldFire && state.repulsorOpacity < 0.03) {
+        repulsorVideo.pause();
+      }
+
+      state.repulsorOpacity = lerp(state.repulsorOpacity, shouldFire ? 1 : 0, shouldFire ? 0.18 : 0.1);
+      const kickTime = state.repulsorKick ? (now - state.repulsorKick) / 1000 : 0;
+      const flash = smoothstep(0.02, 0.18, kickTime) * (1 - smoothstep(0.28, 0.8, kickTime));
+      const palmRadius = clamp(hand.palmSize * 0.36, 28, 82);
+      const palmPosition = hand.palmCenter.clone().add(hand.axisY.clone().multiplyScalar(hand.palmSize * 0.03));
+
+      repulsorGroup.position.lerp(new THREE.Vector3(palmPosition.x, palmPosition.y, 92), 0.36);
+      repulsorGroup.rotation.z = angleLerp(repulsorGroup.rotation.z, hand.axisXAngle, 0.3);
+      repulsorLight.position.set(repulsorGroup.position.x, repulsorGroup.position.y, 160);
+      repulsorLight.intensity = state.repulsorOpacity * (3.4 + flash * 7.5);
+
+      for (const part of repulsorParts) {
+        part.visible = state.repulsorOpacity > 0.02;
+        if (part.userData.role === "video") {
+          const size = palmRadius * (1.42 + flash * 0.16);
+          part.position.set(0, 0, 0);
+          part.scale.set(size, size, 1);
+          part.material.opacity = clamp(state.repulsorOpacity * (0.62 + flash * 0.38), 0, 1);
+        } else if (part.userData.role === "outer") {
+          const radius = palmRadius * (0.72 + Math.sin(timeSeconds * 4.4) * 0.025 + flash * 0.2);
+          part.position.set(0, 0, 12);
+          part.scale.set(radius, radius, radius);
+          part.rotation.z += delta * (1.6 + state.repulsorOpacity * 1.8);
+          part.material.opacity = state.repulsorOpacity * (0.55 + flash * 0.35);
+        } else if (part.userData.role === "inner") {
+          const radius = palmRadius * (0.43 + Math.cos(timeSeconds * 5.8) * 0.018 + flash * 0.12);
+          part.position.set(0, 0, 16);
+          part.scale.set(radius, radius, radius);
+          part.rotation.z -= delta * 2.4;
+          part.material.opacity = state.repulsorOpacity * (0.8 + flash * 0.2);
+        } else if (part.userData.role === "flare") {
+          const radius = palmRadius * (1.04 + flash * 1.35);
+          part.position.set(0, 0, -4);
+          part.scale.set(radius, radius, 1);
+          part.material.opacity = state.repulsorOpacity * (0.16 + flash * 0.34);
+        }
+      }
+    }
+
+    function render(time) {
+      const now = performance.now();
+      const delta = Math.min((time - state.lastTime) / 1000, 0.05);
+      state.lastTime = time;
+      const timeSeconds = time / 1000;
+      const suitTime = state.suitActive && state.suitStart ? Math.max(0, (now - state.suitStart) / 1000) : 0;
+
+      updateGlove(timeSeconds, delta);
+      drawTrackingLayer(timeSeconds, suitTime);
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    async function bootHandTracking() {
+      const hands = new window.Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.62,
+        minTrackingConfidence: 0.68
+      });
+      hands.onResults(onHandResults);
+
+      const cameraFeed = new window.Camera(video, {
+        onFrame: async () => {
+          await hands.send({ image: video });
+        },
+        width: 1280,
+        height: 720
+      });
+
+      await cameraFeed.start();
+      updateVideoRect();
+    }
+
+    window.addEventListener("resize", resize);
+    video.addEventListener("loadedmetadata", updateVideoRect);
+
+    createGlove();
+    resetGlove();
+    resize();
+    requestAnimationFrame(render);
+    repulsorVideo.load();
+    bootHandTracking().catch(() => {
+      trackingCtx.clearRect(0, 0, viewport.width, viewport.height);
+    });
+  </script>
+</body>
+</html>
