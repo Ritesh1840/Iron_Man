@@ -2,7 +2,7 @@ IronmanGlove
 
 How to use:
 
-1) open main.html on your browser locally
+1) open index.html on your browser locally
 
 2) raise hand for glove formation
 
